@@ -6,13 +6,14 @@
  * Description: This script fetches data from the CSV file 'Book1.csv' in the file cabinet (folder ID 2777783),
  * compares item location data using a saved search 'customsearch_ous_location_data' for location names,
  * creates a JSON of locations from the item's locations sublist, uses it to populate location data fields,
- * performs calculations for matched locations, and creates/updates custom records for staging data attached to the Staging Data subtab.
+ * performs calculations for matched locations, creates/updates custom records for staging data attached to the Staging Data subtab,
+ * and removes custom records for locations not present in the updated saved search.
  * Uses native JavaScript for CSV parsing and includes detailed logging.
  *
  * Version History:
  * | Version | Date       | Author           | Remarks                                  |
  * |---------|------------|------------------|------------------------------------------|
- * | 1.00    | 2025-06-18 | Himanshu Kumar   | Initial version                          |
+ * | 1.00    | 2025-06-18 | Yogesh Bhurley   | Initial version                          |
  */
 
 /**
@@ -34,7 +35,6 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 log.error('Invalid Date Object', 'Date value is invalid: ' + dateValue);
                 return null;
             }
-            // Ensure date is within a reasonable range (2000 to 2030)
             var year = dateObj.getFullYear();
             if (year < 2000 || year > 2030) {
                 log.error('Date Out of Range', 'Date year ' + year + ' is outside valid range (2000-2030): ' + dateValue);
@@ -45,7 +45,6 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 type: format.Type.DATE,
                 timezone: format.Timezone.AMERICA_NEW_YORK
             });
-            // Validate the formatted date by parsing it back
             var parsedDate = format.parse({
                 value: formattedDate,
                 type: format.Type.DATE
@@ -54,7 +53,6 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 log.error('Invalid Formatted Date', 'Formatted date is invalid: ' + formattedDate);
                 return null;
             }
-            // Ensure the format is strictly MM/DD/YYYY
             var dateParts = formattedDate.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
             if (!dateParts) {
                 log.error('Invalid Date Format', 'Formatted date does not match MM/DD/YYYY: ' + formattedDate);
@@ -91,8 +89,8 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 return header.trim();
             });
             var data = [];
+            var itemLocationsMap = {};
 
-            var locationReductions = {};
             for (var i = 1; i < csvLines.length; i++) {
                 if (!csvLines[i]) continue;
                 var fields = csvLines[i].split(',').map(function(field) {
@@ -106,41 +104,55 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 var locationName = rowData['LOCATION'];
                 log.debug('Location Name in File', 'Item ID: ' + itemId + ', Location Name: ' + locationName);
                 var netSuiteReduction = parseFloat(rowData['Staging Data']) || 0;
+
                 if (itemId && locationName) {
+                    if (!itemLocationsMap[itemId]) {
+                        itemLocationsMap[itemId] = {
+                            locations: [],
+                            locationReductions: {}
+                        };
+                    }
+                    itemLocationsMap[itemId].locations.push({
+                        locationName: locationName,
+                        netSuiteReduction: netSuiteReduction
+                    });
                     var key = itemId + '_' + locationName;
-                    locationReductions[key] = netSuiteReduction;
+                    itemLocationsMap[itemId].locationReductions[key] = netSuiteReduction;
                 }
-                data.push(rowData);
                 log.debug('Parsed CSV Row', 'Row ' + i + ': ' + JSON.stringify(rowData));
             }
 
-            data.forEach(function(row) {
-                row.locationReductions = locationReductions;
-            });
+            for (var itemId in itemLocationsMap) {
+                data.push({
+                    itemId: itemId,
+                    locations: itemLocationsMap[itemId].locations,
+                    locationReductions: itemLocationsMap[itemId].locationReductions
+                });
+            }
 
-            log.audit('Input Data Prepared', 'Total Rows: ' + data.length);
-            return data.length > 0 ? data : [{ 'MEMBER_INTERNAL_ID': '6585' }];
+            log.audit('Input Data Prepared', 'Total Items: ' + data.length);
+            return data.length > 0 ? data : [{ 'itemId': '6585', 'locations': [], 'locationReductions': {} }];
         } catch (e) {
             log.error('GetInputData Error', 'Error in getInputData: ' + e.message + ', Stack: ' + e.stack);
-            return [{ 'MEMBER_INTERNAL_ID': '6585' }];
+            return [{ 'itemId': '6585', 'locations': [], 'locationReductions': {} }];
         }
     }
     
     function map(context) {
         try {
-            var row = JSON.parse(context.value);
-            log.debug('Map Start', 'Processing Row Data: ' + JSON.stringify(row));
+            var itemData = JSON.parse(context.value);
+            log.debug('Map Start', 'Processing Item Data: ' + JSON.stringify(itemData));
 
-            var itemId = row['MEMBER_INTERNAL_ID'];
-            var csvLocationName = row['LOCATION'];
-            var locationReductions = row.locationReductions;
+            var itemId = itemData.itemId;
+            var locations = itemData.locations;
+            var locationReductions = itemData.locationReductions;
 
-            if (!itemId) {
-                log.error('Invalid Row', 'Row missing item ID: ' + JSON.stringify(row));
+            if (!itemId || !locations || locations.length === 0) {
+                log.error('Invalid Item Data', 'Item missing ID or locations: ' + JSON.stringify(itemData));
                 return;
             }
 
-            log.debug('Data Extracted', 'Item ID: ' + itemId + ', CSV Location Name: ' + csvLocationName);
+            log.debug('Data Extracted', 'Item ID: ' + itemId + ', Locations: ' + JSON.stringify(locations));
 
             var itemRecord = record.load({
                 type: record.Type.INVENTORY_ITEM,
@@ -234,7 +246,6 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 log.error('Empty Search Results', 'Saved search customsearch_ous_location_data returned no results. Please verify the search configuration.');
             } else {
                 locationResults.forEach(function(result) {
-                    log.debug('Raw Search Result', 'Result: ' + JSON.stringify(result));
                     var locId = result.getValue({ name: 'internalid' });
                     var locName = result.getValue({ name: 'formulatext' });
                     if (locId && locName) {
@@ -247,104 +258,114 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
             }
             log.debug('JSON Created', 'Location Map: ' + JSON.stringify(locationMap));
 
-            var matchedLocId = locationMap[csvLocationName];
-            if (!matchedLocId) {
-                for (var locName in locationMap) {
-                    if (locName.includes(csvLocationName) || (csvLocationName.match(/\d+/) && locName.includes(csvLocationName.match(/\d+/)[0]))) {
-                        matchedLocId = locationMap[locName];
-                        log.debug('Partial Match Found', 'CSV Location Name: ' + csvLocationName + ', Matched Location Name: ' + locName + ', Matched Location ID: ' + matchedLocId);
-                        break;
-                    }
-                }
-            }
-            log.debug('Location Name Found from File', 'CSV Location Name: ' + csvLocationName + ', Matched Location ID: ' + matchedLocId);
-            if (!matchedLocId) {
-                log.debug('Location Not Found', 'No matching location ID found for name: ' + csvLocationName);
-                return;
-            }
-            log.debug('Location Internal ID Found', 'Using Location ID: ' + matchedLocId + ' for Item ID: ' + itemId);
-
             var batchSize = 20;
             var usage = runtime.getCurrentScript().getRemainingUsage();
             log.debug('Initial Governance Usage', 'Remaining Units: ' + usage);
-            for (var j = 0; j < lineCount; j += batchSize) {
-                var end = Math.min(j + batchSize, lineCount);
-                try {
-                    usage = runtime.getCurrentScript().getRemainingUsage();
-                    log.debug('Batch Start', 'Processing batch from line ' + j + ' to ' + (end - 1) + ', Remaining Units: ' + usage);
-                    for (var k = j; k < end; k++) {
-                        var locId = itemRecord.getSublistValue({
-                            sublistId: 'locations',
-                            fieldId: 'location',
-                            line: k
-                        });
-                        var locationName = itemRecord.getSublistValue({
-                            sublistId: 'locations',
-                            fieldId: 'locationname',
-                            line: k
-                        }) || locId;
-                        log.debug('Processing Location', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Name: ' + locationName + ' at line ' + k);
 
-                        if (processedLocations.indexOf(locId) === -1) {
-                            log.debug('Skipped Location', 'Location ID: ' + locId + ', Name: ' + locationName + ' was not in initial sublist scan for Item ID: ' + itemId);
-                            continue;
+            locations.forEach(function(csvLocation) {
+                var csvLocationName = csvLocation.locationName;
+                var netSuiteReduction = csvLocation.netSuiteReduction;
+
+                var matchedLocId = locationMap[csvLocationName];
+                if (!matchedLocId) {
+                    for (var locName in locationMap) {
+                        if (locName.toLowerCase() === csvLocationName.toLowerCase()) {
+                            matchedLocId = locationMap[locName];
+                            log.debug('Exact Case-Insensitive Match Found', 'CSV Location Name: ' + csvLocationName + ', Matched Location Name: ' + locName + ', Matched Location ID: ' + matchedLocId);
+                            break;
                         }
-
-                        var locationData = itemLocationsMap[locId];
-                        if (!locationData) {
-                            log.debug('No Location Data', 'No data found in itemLocationsMap for Location ID: ' + locId);
-                            continue;
-                        }
-
-                        var netSuiteReduction = locationReductions[itemId + '_' + csvLocationName] || 0;
-                        var isCsvMatch = (parseInt(locId, 10) === matchedLocId);
-
-                        log.debug('Location Data', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Is CSV Match: ' + isCsvMatch + ', NetSuite Reduction: ' + netSuiteReduction);
-
-                        locationData.itemId = itemId;
-                        locationData.netSuiteReduction = Number((netSuiteReduction || 0).toFixed(2));
-                        locationData.isCsvMatch = isCsvMatch;
-
-                        if (isCsvMatch && netSuiteReduction > 0) {
-                            locationData.stagedQty = Number((netSuiteReduction - locationData.onHand).toFixed(2));
-                            locationData.availableQty = Number((locationData.onHand - locationData.stagedQty).toFixed(2));
-                        } else {
-                            locationData.stagedQty = 0.00;
-                            locationData.availableQty = 0.00;
-                            log.debug('Skipped Calculation', 'No calculations for non-matching location ID: ' + locId + ', Name: ' + locationName);
-                        }
-
-                        log.debug('Calculated Quantities', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Name: ' + locationName + ', Staged Quantity: ' + locationData.stagedQty + ', Available Quantity: ' + locationData.availableQty);
-                        log.audit('Before Write', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Last Count Date: ' + (locationData.lastInvtCountDate || 'null') + ', Next Count Date: ' + (locationData.nextInvtCountDate || 'null'));
-
-                        usage = runtime.getCurrentScript().getRemainingUsage();
-                        if (usage < 500) {
-                            log.debug('Governance Warning', 'Remaining Units: ' + usage + '. Yielding at line ' + k);
-                            return;
-                        }
-                        try {
-                            context.write({
-                                key: itemId + '_' + locId,
-                                value: JSON.stringify(locationData)
-                            });
-                            log.debug('After Write', 'Item ID: ' + itemId + ', Location ID: ' + locId);
-                        } catch (writeError) {
-                            log.error('Write Error', 'Failed to write context for Item ID: ' + itemId + ', Location ID: ' + locId + ', Message: ' + writeError.message + ', Stack: ' + writeError.stack);
+                        if (locName.includes(csvLocationName) || (csvLocationName.match(/\d+/) && locName.includes(csvLocationName.match(/\d+/)[0]))) {
+                            matchedLocId = locationMap[locName];
+                            log.debug('Partial Match Found', 'CSV Location Name: ' + csvLocationName + ', Matched Location Name: ' + locName + ', Matched Location ID: ' + matchedLocId);
+                            break;
                         }
                     }
-                    log.debug('Batch Completed', 'Finished processing batch from line ' + j + ' to ' + (end - 1));
-                } catch (batchError) {
-                    log.error('Batch Error', 'Error processing batch from line ' + j + ' to ' + (end - 1) + ', Message: ' + batchError.message + ', Stack: ' + batchError.stack);
                 }
-                usage = runtime.getCurrentScript().getRemainingUsage();
-                if (usage < 500) {
-                    log.debug('Governance Warning', 'Remaining Units: ' + usage + '. Yielding after batch ending at line ' + (end - 1));
+                log.debug('Location Name Found from File', 'CSV Location Name: ' + csvLocationName + ', Matched Location ID: ' + (matchedLocId || 'none'));
+
+                if (!matchedLocId) {
+                    log.error('Location Not Found', 'No matching location ID found for name: ' + csvLocationName);
                     return;
                 }
-            }
-            log.debug('Map Completed', 'Processed all ' + lineCount + ' locations for Item ID: ' + itemId);
+                log.debug('Location Internal ID Found', 'Using Location ID: ' + matchedLocId + ' for Item ID: ' + itemId);
+
+                var lineIndex = -1;
+                for (var j = 0; j < lineCount; j++) {
+                    var locId = itemRecord.getSublistValue({
+                        sublistId: 'locations',
+                        fieldId: 'location',
+                        line: j
+                    });
+                    if (parseInt(locId, 10) === matchedLocId) {
+                        lineIndex = j;
+                        break;
+                    }
+                }
+
+                if (lineIndex === -1) {
+                    log.error('Sublist Location Not Found', 'No sublist entry found for Location ID: ' + matchedLocId + ' for Item ID: ' + itemId);
+                    return;
+                }
+
+                var locId = matchedLocId;
+                var locationName = itemRecord.getSublistValue({
+                    sublistId: 'locations',
+                    fieldId: 'locationname',
+                    line: lineIndex
+                }) || locId;
+                log.debug('Processing Location', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Name: ' + locationName + ' at line ' + lineIndex);
+
+                if (processedLocations.indexOf(locId) === -1) {
+                    log.debug('Skipped Location', 'Location ID: ' + locId + ', Name: ' + locationName + ' was not in initial sublist scan for Item ID: ' + itemId);
+                    return;
+                }
+
+                var locationData = itemLocationsMap[locId];
+                if (!locationData) {
+                    log.debug('No Location Data', 'No data found in itemLocationsMap for Location ID: ' + locId);
+                    return;
+                }
+
+                var isCsvMatch = true;
+                var locationKey = itemId + '_' + csvLocationName;
+                var reduction = locationReductions[locationKey] || 0;
+
+                log.debug('Location Data', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Is CSV Match: ' + isCsvMatch + ', NetSuite Reduction: ' + reduction);
+
+                locationData.itemId = itemId;
+                locationData.netSuiteReduction = Number((reduction || 0).toFixed(2));
+                locationData.isCsvMatch = isCsvMatch;
+
+                if (isCsvMatch && reduction > 0) {
+                    locationData.stagedQty = Number((reduction).toFixed(2));
+                    locationData.availableQty = Number((locationData.onHand - locationData.stagedQty).toFixed(2));
+                } else {
+                    locationData.stagedQty = 0.00;
+                    locationData.availableQty = 0.00;
+                    log.debug('Skipped Calculation', 'No calculations for non-matching location ID: ' + locId + ', Name: ' + locationName);
+                }
+
+                log.debug('Calculated Quantities', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Name: ' + locationName + ', Staged Quantity: ' + locationData.stagedQty + ', Available Quantity: ' + locationData.availableQty);
+                log.audit('Before Write', 'Item ID: ' + itemId + ', Location ID: ' + locId + ', Last Count Date: ' + (locationData.lastInvtCountDate || 'null') + ', Next Count Date: ' + (locationData.nextInvtCountDate || 'null'));
+
+                usage = runtime.getCurrentScript().getRemainingUsage();
+                if (usage < 500) {
+                    log.debug('Governance Warning', 'Remaining Units: ' + usage + '. Yielding for Location ID: ' + locId);
+                    return;
+                }
+                try {
+                    context.write({
+                        key: itemId + '_' + locId,
+                        value: JSON.stringify(locationData)
+                    });
+                    log.debug('After Write', 'Item ID: ' + itemId + ', Location ID: ' + locId);
+                } catch (writeError) {
+                    log.error('Write Error', 'Failed to write context for Item ID: ' + itemId + ', Location ID: ' + locId + ', Message: ' + writeError.message + ', Stack: ' + writeError.stack);
+                }
+            });
+            log.debug('Map Completed', 'Processed all locations for Item ID: ' + itemId);
         } catch (e) {
-            log.error('Map Error', 'Error processing file ID: ' + (context.value ? JSON.parse(context.value).fileId : 'unknown') + ', Message: ' + e.message + ', Stack: ' + e.stack);
+            log.error('Map Error', 'Error processing Item ID: ' + (itemData ? itemData.itemId : 'unknown') + ', Message: ' + e.message + ', Stack: ' + e.stack);
         }
     }
     
@@ -464,12 +485,10 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 customRecord.setValue({ fieldId: 'custrecordous_defaultreturncost', value: locationData.defaultReturnCost || 0 });
                 customRecord.setValue({ fieldId: 'custrecordous_quantityavailablebase', value: locationData.quantityAvailableBase || 0 });
 
-                // Log date values before setting
                 log.debug('Setting Date Fields', 'Item ID: ' + itemId + ', Location ID: ' + locationId + 
                     ', Last Count Date: ' + (locationData.lastInvtCountDate || 'null') + 
                     ', Next Count Date: ' + (locationData.nextInvtCountDate || 'null'));
 
-                // Use setText for date fields in dynamic mode
                 customRecord.setText({ fieldId: 'custrecordous_lastinvtcountdate', text: locationData.lastInvtCountDate || null });
                 customRecord.setText({ fieldId: 'custrecordous_nextinvtcountdate', text: locationData.nextInvtCountDate || null });
                 customRecord.setValue({ fieldId: 'custrecordous_invtcountinterval', value: locationData.invtCountInterval || 0 });
@@ -504,6 +523,66 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
             } else {
                 log.debug('Record Attachment Skipped', 'Custom Record ID: ' + customRecordId + ' already attached to Item ID: ' + locationData.itemId);
             }
+
+            try {
+                var locationSearch = search.load({
+                    id: 'customsearch_ous_location_data'
+                });
+                var locationResults = locationSearch.run().getRange({ start: 0, end: 1000 });
+                var validLocationIds = locationResults.map(function(result) {
+                    return parseInt(result.getValue({ name: 'internalid' }), 10);
+                });
+                log.debug('Valid Locations', 'Valid Location IDs from saved search: ' + JSON.stringify(validLocationIds));
+
+                var allCustomRecordsSearch = search.create({
+                    type: 'customrecord_ous__staging_data',
+                    filters: [
+                        ['custrecordous_item_link', 'is', itemId]
+                    ],
+                    columns: [
+                        'internalid',
+                        'custrecordous_location'
+                    ]
+                });
+
+                var recordsToDelete = [];
+                var searchResultCount = allCustomRecordsSearch.runPaged().count;
+                log.debug('Custom Records Search', 'Found ' + searchResultCount + ' custom records for Item ID: ' + itemId);
+
+                allCustomRecordsSearch.run().each(function(result) {
+                    var recordId = result.getValue('internalid');
+                    var locId = parseInt(result.getValue('custrecordous_location'), 10);
+                    if (validLocationIds.indexOf(locId) === -1 && recordId !== customRecordId) {
+                        recordsToDelete.push(recordId);
+                        log.debug('Record to Delete', 'Custom Record ID: ' + recordId + ', Location ID: ' + locId + ' not in saved search');
+                    }
+                    return true;
+                });
+
+                var deleteBatchSize = 10;
+                for (var i = 0; i < recordsToDelete.length; i += deleteBatchSize) {
+                    var usage = runtime.getCurrentScript().getRemainingUsage();
+                    if (usage < 500) {
+                        log.debug('Governance Warning', 'Remaining Units: ' + usage + '. Yielding before deleting batch starting at index ' + i);
+                        return;
+                    }
+                    var batch = recordsToDelete.slice(i, i + deleteBatchSize);
+                    batch.forEach(function(recordId) {
+                        try {
+                            record.delete({
+                                type: 'customrecord_ous__staging_data',
+                                id: recordId
+                            });
+                            log.audit('Record Deleted', 'Deleted custom record ID: ' + recordId + ' for Item ID: ' + itemId + ' as its location is not in saved search');
+                        } catch (deleteError) {
+                            log.error('Delete Error', 'Failed to delete custom record ID: ' + recordId + ' for Item ID: ' + itemId + ', Message: ' + deleteError.message + ', Stack: ' + deleteError.stack);
+                        }
+                    });
+                    log.debug('Deletion Batch Completed', 'Processed deletion batch from index ' + i + ' to ' + (i + batch.length - 1));
+                }
+            } catch (deleteProcessError) {
+                log.error('Delete Process Error', 'Error processing deletion of invalid custom records for Item ID: ' + itemId + ', Message: ' + deleteProcessError.message + ', Stack: ' + deleteProcessError.stack);
+            }
         } catch (e) {
             log.error('Reduce Error', 'Error processing Item ID: ' + (locationData ? locationData.itemId : 'unknown') + ', Location ID: ' + (locationData ? locationData.locationId : 'unknown') + ', Message: ' + e.message + ', Stack: ' + e.stack);
         }
@@ -527,7 +606,7 @@ define(['N/file', 'N/record', 'N/search', 'N/runtime', 'N/format'], function(fil
                 log.debug('Summarize', 'No reduce errors found.');
             }
             
-            log.audit('Summary', 'Processing completed. Total records processed: ' + (summary.inputSummary.total || 0));
+            log.audit('Summary', 'Processing completed. Total items processed: ' + (summary.inputSummary.total || 0));
         } catch (e) {
             log.error('Summarize Error', 'Error in summarize: ' + e.message + ', Stack: ' + e.stack);
         }

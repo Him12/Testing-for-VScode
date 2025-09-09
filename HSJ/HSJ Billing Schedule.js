@@ -1,4 +1,16 @@
 /**
+ * Copyright (c) 2025 HSJ, Inc.
+ * All Rights Reserved.
+ *
+ * Script Name: HSJ | Billing Schedule Line
+ * Version History:
+ *
+ * | Version | Date       | Author           | Remarks                                  |
+ * |---------|------------|------------------|------------------------------------------|
+ * | 1.00    | 2025-08-12 | Himanshu Kumar   | Apply Billing schedule at line level     |
+ */
+
+/**
  * @NApiVersion 2.x
  * @NScriptType MapReduceScript
  */
